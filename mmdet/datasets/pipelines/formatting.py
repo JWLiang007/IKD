@@ -213,9 +213,9 @@ class DefaultFormatBundle:
             dict: The result dict contains the data that is formatted with \
                 default bundle.
         """
-
-        if 'img' in results:
-            img = results['img']
+        for key in results.get('img_fields', ['img']):
+        # if 'img' in results:
+            img = results[key]
             if self.img_to_float is True and img.dtype == np.uint8:
                 # Normally, image is of uint8 type without normalization.
                 # At this time, it needs to be forced to be converted to
@@ -227,7 +227,7 @@ class DefaultFormatBundle:
             if len(img.shape) < 3:
                 img = np.expand_dims(img, -1)
             img = np.ascontiguousarray(img.transpose(2, 0, 1))
-            results['img'] = DC(
+            results[key] = DC(
                 to_tensor(img), padding_value=self.pad_val['img'], stack=True)
         for key in ['proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels']:
             if key not in results:

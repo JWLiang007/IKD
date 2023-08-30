@@ -20,6 +20,7 @@ from mmdet.models import build_detector
 from mmdet.utils import (collect_env, get_device, get_root_logger,
                          replace_cfg_vals, setup_multi_processes,
                          update_data_root)
+from mmdet.distillation import build_distiller
 
 
 def parse_args():
@@ -85,7 +86,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local-rank', type=int, default=0)
     parser.add_argument(
         '--auto-scale-lr',
         action='store_true',
@@ -209,11 +210,25 @@ def main():
     meta['seed'] = seed
     meta['exp_name'] = osp.basename(args.config)
 
-    model = build_detector(
-        cfg.model,
-        train_cfg=cfg.get('train_cfg'),
-        test_cfg=cfg.get('test_cfg'))
-    model.init_weights()
+    # model = build_detector(
+    #     cfg.model,
+    #     train_cfg=cfg.get('train_cfg'),
+    #     test_cfg=cfg.get('test_cfg'))
+    # model.init_weights()
+    distiller_cfg = cfg.get('distiller',None)
+    if distiller_cfg is None:
+        model = build_detector(
+            cfg.model,
+            train_cfg=cfg.get('train_cfg'),
+            test_cfg=cfg.get('test_cfg'))
+        model.init_weights()
+    else:
+        teacher_cfg = Config.fromfile(cfg.teacher_cfg)
+        student_cfg = Config.fromfile(cfg.student_cfg)
+
+        model = build_distiller(cfg.distiller,teacher_cfg,student_cfg,
+         train_cfg=student_cfg.get('train_cfg'),
+         test_cfg=student_cfg.get('test_cfg'))
 
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:

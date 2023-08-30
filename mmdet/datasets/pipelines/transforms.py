@@ -3,6 +3,8 @@ import copy
 import inspect
 import math
 import warnings
+import os
+import random
 
 import cv2
 import mmcv
@@ -460,6 +462,11 @@ class RandomFlip:
             cur_dir = np.random.choice(direction_list, p=flip_ratio_list)
 
             results['flip'] = cur_dir is not None
+            # if 'flip_flag' in results:
+            #     assert isinstance(results['flip_flag'], bool) and results['flip_flag']==False
+            #     results['flip'] = results['flip_flag']
+            #     cur_dir = None
+
         if 'flip_direction' not in results:
             results['flip_direction'] = cur_dir
         if results['flip']:
@@ -573,6 +580,93 @@ class RandomShift:
     def __repr__(self):
         repr_str = self.__class__.__name__
         repr_str += f'(max_shift_px={self.max_shift_px}, '
+        return repr_str
+
+
+@PIPELINES.register_module()
+class InstanceAug:
+
+    def __init__(self,
+                 size=32*32,
+                 prob=0.5,
+                 show_dir=None,
+                 subst_full=False,
+                 subst_stg='2',
+                 # flip_stg = '0',
+                 mode='single',
+                 corruption='adv',   # param of corruption
+                 severity=None  # param of corruption
+                 ):
+        self.size = size
+        self.prob = prob
+        self.show_dir = show_dir
+        self.subst_full = subst_full
+        self.subst_stg = subst_stg
+        # self.flip_stg = flip_stg
+        self.mode = mode  # different high frequency noise
+        self.corruption = corruption
+        self.severity = severity
+
+    def get_corrupt_img(self, results,corruption,severity=None):
+        if corruption == 'adv':
+            assert 'adv' in results['img_fields'] or 'adp' in results['img_fields']
+            corrupt_img = results['adv']
+            if 'adp' in results['img_fields']:
+                corrupt_img = results['adp']
+            
+        else :
+            assert severity is not None
+            corrupt_img = corrupt(results['img'].astype(np.uint8),
+                    corruption_name=corruption,
+                    severity=severity)
+        return corrupt_img
+
+    def __call__(self, results):
+        if random.random() > self.prob:
+            return results
+        if self.mode == 'comb':
+            noise_set = []
+            for corruption,severity in zip(self.corruption,self.severity):
+                noise_set.append(self.get_corrupt_img(results,corruption,severity))
+            idx = random.choice(range(len(noise_set)))
+            corrupt_img = noise_set[idx]
+        else:
+            corrupt_img = self.get_corrupt_img(results,self.corruption,self.severity)
+        ori_img = results['img']
+        ori_img_copy = ori_img.copy()
+        find_s_bbox = False
+        all_s_bbox = True
+        for bbox in results['ann_info']['bboxes']:
+            ys, xs, ye, xe = bbox.astype(int)
+            bbox_size = (xe - xs)*(ye - ys)
+            if bbox_size < self.size:
+                ori_img[xs:xe, ys:ye, :] = corrupt_img[xs:xe, ys:ye, :]
+                out_img = ori_img.copy()
+                out_img[xs:xe, ys:ys+3, :] = (0, 0, 255)
+                out_img[xs:xe, ye:ye+3, :] = (0, 0, 255)
+                out_img[xs:xs+3, ys:ye, :] = (0, 0, 255)
+                out_img[xe:xe+3, ys:ye, :] = (0, 0, 255)
+                find_s_bbox = True
+            else:
+                all_s_bbox = False
+        if self.subst_full and ((find_s_bbox and self.subst_stg == '1') or (all_s_bbox and self.subst_stg == '2')):
+            results['img'] = corrupt_img.copy()
+            return results
+        if not all_s_bbox and self.subst_stg == '2':
+            results['img'] = ori_img_copy
+        # if (not find_s_bbox or not all_s_bbox ) and self.flip_stg == '1':
+        #     results['flip_flag'] = False
+        if self.show_dir != None and find_s_bbox:
+            out_path = os.path.join(self.show_dir, results['ori_filename'])
+            mmcv.imwrite(out_img, out_path)
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(size={self.size}, '
+        repr_str += f'prob={self.prob}, '
+        if self.show_dir is not None:
+            repr_str += f'show_dir={self.show_dir}, '
         return repr_str
 
 
@@ -758,7 +852,13 @@ class RandomCrop:
                  crop_type='absolute',
                  allow_negative_crop=False,
                  recompute_bbox=False,
-                 bbox_clip_border=True):
+                 bbox_clip_border=True,
+                 adaptive=False,
+                 bbox_size=(32, 32),
+                 subst_stg='1',
+                 instance_crop=False,
+                 # flip_stg='0'
+                 ):  # 1:(1+flip) 2:(2+flip)
         if crop_type not in [
                 'relative_range', 'relative', 'absolute', 'absolute_range'
         ]:
@@ -783,6 +883,12 @@ class RandomCrop:
             'gt_bboxes': 'gt_masks',
             'gt_bboxes_ignore': 'gt_masks_ignore'
         }
+        self.adaptive = adaptive
+        assert len(bbox_size) == 2
+        self.bbox_size = bbox_size[0] * bbox_size[1]
+        self.subst_stg = subst_stg
+        # self.flip_stg = flip_stg
+        self.instance_crop = instance_crop
 
     def _crop_data(self, results, crop_size, allow_negative_crop):
         """Function to randomly crop images, bounding boxes, masks, semantic
@@ -851,6 +957,96 @@ class RandomCrop:
 
         return results
 
+    def _crop_instance_data(self, results, crop_size, allow_negative_crop, large_bbox_idct):
+        """Function to randomly crop images, bounding boxes, masks, semantic
+        segmentation maps.
+
+        Args:
+            results (dict): Result dict from loading pipeline.
+            crop_size (tuple): Expected absolute size after cropping, (h, w).
+            allow_negative_crop (bool): Whether to allow a crop that does not
+                contain any bbox area. Default to False.
+
+        Returns:
+            dict: Randomly cropped results, 'img_shape' key in result dict is
+                updated according to crop size.
+        """
+        assert results.get('bbox_fields') == ['gt_bboxes_ignore', 'gt_bboxes']
+        assert 'relative' in self.crop_type
+        ori_bbox_results = {}
+        crop_size_np = np.array(self.crop_size)
+        for key in results.get('bbox_fields', []):
+            ori_gt_bboxes = results.get(key).copy()
+            new_gt_bboxes = ori_gt_bboxes.copy()
+            num_bboxes = new_gt_bboxes.shape[0]
+            if key == 'gt_bboxes':
+
+                bboxes_width = new_gt_bboxes[:, 2]-new_gt_bboxes[:, 0]
+                bboxes_height = new_gt_bboxes[:, 3]-new_gt_bboxes[:, 1]
+                offset_height, offset_width = np.random.rand(
+                    2, num_bboxes) * np.expand_dims((1-crop_size_np), 1) * np.array([bboxes_height, bboxes_width])
+                new_bbox_height, new_bbox_width = np.expand_dims(
+                    crop_size_np, 1) * np.array([bboxes_height, bboxes_width])
+                new_x0, new_y0, new_x1, new_y1 = new_gt_bboxes[:, 0]+offset_width, new_gt_bboxes[:, 1]+offset_height,\
+                    new_gt_bboxes[:, 0]+offset_width+new_bbox_width, new_gt_bboxes[:, 1] + \
+                    offset_height+new_bbox_height
+                new_gt_bboxes = np.stack(
+                    [new_x0, new_y0, new_x1, new_y1], axis=1)
+
+            valid_inds = (new_gt_bboxes[:, 2] > new_gt_bboxes[:, 0]) & (
+                new_gt_bboxes[:, 3] > new_gt_bboxes[:, 1])
+
+            if (key == 'gt_bboxes' and not valid_inds.any()
+                    and not allow_negative_crop):
+                return None
+            ori_bbox_results[key] = ori_gt_bboxes[valid_inds].copy()
+            if key == 'gt_bboxes':
+
+                valid_idx = np.where(large_bbox_idct == True)[0]
+                while(True):
+                    ious = bbox_overlaps(
+                        ori_gt_bboxes[valid_idx], ori_gt_bboxes[valid_idx])
+                    ious = ious - 2 * np.identity(ious.shape[0])
+                    ious_sum = ious.sum(1)
+                    if ious_sum.max() == -1:
+                        break
+                    keep_idx = random.choice(np.where(ious_sum != -1)[0], 1)[0]
+                    keep_mask = np.logical_or(
+                        ious[keep_idx] == 0, ious[keep_idx] == -1)
+                    valid_idx = valid_idx[keep_mask]
+
+                results[key][valid_idx] = new_gt_bboxes[valid_idx]
+            results[key] = results[key][valid_inds]
+
+            mask_key = self.bbox2mask.get(key)
+            if mask_key in results:
+                results[mask_key] = results[mask_key][
+                    valid_inds.nonzero()[0]].instance_crop(
+                        results[key].copy())
+                if self.recompute_bbox:
+                    results[key] = results[mask_key].get_bboxes()
+
+        for key in results.get('seg_fields', []):
+            results[key] = results[key]
+
+        for img_key in results.get('img_fields', ['img']):
+            ori_img = results[img_key].copy()
+            new_img = ori_img.copy()
+            for bbox_key in results.get('bbox_fields', []):
+                new_bboxes = results[bbox_key]
+
+                assert new_bboxes.shape == ori_bbox_results[bbox_key].shape
+                for i, ori_bbox in enumerate(ori_bbox_results[bbox_key]):
+                    ori_x0, ori_y0, ori_x1, ori_y1 = ori_bbox.astype(np.int32)
+                    new_bbox = results[bbox_key][i]
+                    new_x0, new_y0, new_x1, new_y1 = new_bbox.astype(np.int32)
+                    new_img[ori_y0:ori_y1, ori_x0:ori_x1] = 0
+                    new_img[new_y0:new_y1, new_x0:
+                            new_x1] = ori_img[new_y0:new_y1, new_x0:new_x1].copy()
+            results[img_key] = new_img
+
+        return results
+
     def _get_crop_size(self, image_size):
         """Randomly generates the absolute crop size based on `crop_type` and
         `image_size`.
@@ -892,9 +1088,33 @@ class RandomCrop:
             dict: Randomly cropped results, 'img_shape' key in result dict is
                 updated according to crop size.
         """
+
+        if self.adaptive:
+            large_bbox_idct = np.zeros(
+                results['ann_info']['bboxes'].shape[0], dtype=np.bool8)
+            find_s_bbox = False
+            all_s_bbox = True
+
+            for i, bbox in enumerate(results['ann_info']['bboxes']):
+                area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                if area < self.bbox_size:
+                    find_s_bbox = True
+                else:
+                    all_s_bbox = False
+                    large_bbox_idct[i] = True
+            if (self.subst_stg == '1' and find_s_bbox) or (self.subst_stg == '2' and all_s_bbox):
+                # if self.flip_stg == '2':
+                #     results['flip_flag'] = False
+                return results
         image_size = results['img'].shape[:2]
         crop_size = self._get_crop_size(image_size)
-        results = self._crop_data(results, crop_size, self.allow_negative_crop)
+        if not self.instance_crop:
+            results = self._crop_data(results, crop_size, self.allow_negative_crop)
+        else:
+            results = self._crop_instance_data(
+                results, crop_size, self.allow_negative_crop, large_bbox_idct)
+        # if self.flip_stg == '1':
+        #     results['flip_flag'] = False
         return results
 
     def __repr__(self):
@@ -1745,7 +1965,7 @@ class RandomCenterCropPad:
             cropped_center_y - top, cropped_center_y + bottom,
             cropped_center_x - left, cropped_center_x + right
         ],
-                          dtype=np.float32)
+            dtype=np.float32)
 
         return cropped_img, border, patch
 
@@ -2173,40 +2393,40 @@ class Mosaic:
         if loc == 'top_left':
             # index0 to top left part of image
             x1, y1, x2, y2 = max(center_position_xy[0] - img_shape_wh[0], 0), \
-                             max(center_position_xy[1] - img_shape_wh[1], 0), \
-                             center_position_xy[0], \
-                             center_position_xy[1]
+                max(center_position_xy[1] - img_shape_wh[1], 0), \
+                center_position_xy[0], \
+                center_position_xy[1]
             crop_coord = img_shape_wh[0] - (x2 - x1), img_shape_wh[1] - (
                 y2 - y1), img_shape_wh[0], img_shape_wh[1]
 
         elif loc == 'top_right':
             # index1 to top right part of image
             x1, y1, x2, y2 = center_position_xy[0], \
-                             max(center_position_xy[1] - img_shape_wh[1], 0), \
-                             min(center_position_xy[0] + img_shape_wh[0],
-                                 self.img_scale[1] * 2), \
-                             center_position_xy[1]
+                max(center_position_xy[1] - img_shape_wh[1], 0), \
+                min(center_position_xy[0] + img_shape_wh[0],
+                    self.img_scale[1] * 2), \
+                center_position_xy[1]
             crop_coord = 0, img_shape_wh[1] - (y2 - y1), min(
                 img_shape_wh[0], x2 - x1), img_shape_wh[1]
 
         elif loc == 'bottom_left':
             # index2 to bottom left part of image
             x1, y1, x2, y2 = max(center_position_xy[0] - img_shape_wh[0], 0), \
-                             center_position_xy[1], \
-                             center_position_xy[0], \
-                             min(self.img_scale[0] * 2, center_position_xy[1] +
-                                 img_shape_wh[1])
+                center_position_xy[1], \
+                center_position_xy[0], \
+                min(self.img_scale[0] * 2, center_position_xy[1] +
+                    img_shape_wh[1])
             crop_coord = img_shape_wh[0] - (x2 - x1), 0, img_shape_wh[0], min(
                 y2 - y1, img_shape_wh[1])
 
         else:
             # index3 to bottom right part of image
             x1, y1, x2, y2 = center_position_xy[0], \
-                             center_position_xy[1], \
-                             min(center_position_xy[0] + img_shape_wh[0],
-                                 self.img_scale[1] * 2), \
-                             min(self.img_scale[0] * 2, center_position_xy[1] +
-                                 img_shape_wh[1])
+                center_position_xy[1], \
+                min(center_position_xy[0] + img_shape_wh[0],
+                    self.img_scale[1] * 2), \
+                min(self.img_scale[0] * 2, center_position_xy[1] +
+                    img_shape_wh[1])
             crop_coord = 0, 0, min(img_shape_wh[0],
                                    x2 - x1), min(y2 - y1, img_shape_wh[1])
 

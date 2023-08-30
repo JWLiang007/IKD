@@ -12,7 +12,10 @@ from mmcv.cnn import fuse_conv_bn
 from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
 
+# tag
 from mmdet.apis import multi_gpu_test, single_gpu_test
+from adversarial.adv import multi_gpu_adv, single_gpu_adv
+
 from mmdet.datasets import (build_dataloader, build_dataset,
                             replace_ImageToTensor)
 from mmdet.models import build_detector
@@ -20,13 +23,16 @@ from mmdet.utils import (build_ddp, build_dp, compat_cfg, get_device,
                          replace_cfg_vals, setup_multi_processes,
                          update_data_root)
 
-from pth_transfer import change_model
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet test (and eval) a model')
     parser.add_argument('config', help='test config file path')
     parser.add_argument('checkpoint', help='checkpoint file')
+    # tag
+    parser.add_argument(
+        '--gen_adv_aug',action='store_true',help='test on training set and generate adv examples'
+    )
     parser.add_argument(
         '--work-dir',
         help='the directory to save the file containing evaluation metrics')
@@ -105,7 +111,28 @@ def parse_args():
         default='none',
         help='job launcher')
     parser.add_argument('--local-rank', type=int, default=0)
+
+    # attack argument
+
+    parser.add_argument('--method', type=str, default='difgsm', help='attack method')
+    parser.add_argument('--eps', type=float, default=15, help='maximum perturbation')
+    parser.add_argument('--alpha', type=float, default=4, help='step size')
+    parser.add_argument('--steps', type=int, default=5, help='step size')
+    parser.add_argument('--decay', type=float, default=1.0, help='momentum factor')
+    parser.add_argument('--resize_rate', type=float, default=0.9, help='resize factor used in input diversity')
+    parser.add_argument('--diversity_prob', type=float, default=0.5,
+                        help='the probability of applying input diversity of difgsm/tifgsm')
+    parser.add_argument('--random_start', action='store_true', help='using random initialization of delta')
+    parser.add_argument('--kernel_name', type=str, default='gaussian',help='kernel name of tifgsm')
+    parser.add_argument('--len_kernel', type=int, default=15, help='kernel length of tifgsm')
+    parser.add_argument('--nsig', type=int, default=3, help=' radius of gaussian kernel of tisgsm')
+    parser.add_argument('--beta', type=float, default=1.5, help=' the upper bound of neighborhood of vmifgsm')
+    parser.add_argument('--N', type=int, default=20, help=' the number of sampled examples in the neighborhood')
+
+
     args = parser.parse_args()
+    args.eps = args.eps / 255.0
+    args.alpha = args.alpha / 255.0
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
 
@@ -122,27 +149,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    assert args.out or args.eval or args.format_only or args.show \
-        or args.show_dir, \
-        ('Please specify at least one operation (save/eval/format/show the '
-         'results / save the results) with the argument "--out", "--eval"'
-         ', "--format-only", "--show" or "--show-dir"')
-
-    if args.eval and args.format_only:
-        raise ValueError('--eval and --format_only cannot be both specified')
-
-    if args.out is not None and not args.out.endswith(('.pkl', '.pickle')):
-        raise ValueError('The output file must be a pkl file.')
-
     cfg = Config.fromfile(args.config)
-
-    distiller_cfg = cfg.get('distiller', None)
-    if distiller_cfg is not None:
-        cfg = Config.fromfile(cfg.student_cfg)
-        out_path = args.checkpoint.replace(args.checkpoint.split('/')[-1], 'stu_chkp.pth')
-        change_model(args.checkpoint,out_path)
-        args.checkpoint = out_path
-
 
     # replace the ${key} with the value of cfg.key
     cfg = replace_cfg_vals(cfg)
@@ -161,6 +168,16 @@ def main():
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
+
+    # tag
+    _train_cfg = cfg.data.train
+    if args.gen_adv_aug:
+        if hasattr(cfg.data.train,'dataset'):
+            _train_cfg = cfg.data.train.dataset
+        cfg.data.test.ann_file = _train_cfg.ann_file
+        cfg.data.val.ann_file = _train_cfg.ann_file
+        cfg.data.test.img_prefix = _train_cfg.img_prefix
+        cfg.data.val.img_prefix = _train_cfg.img_prefix
 
     if 'pretrained' in cfg.model:
         cfg.model.pretrained = None
@@ -198,14 +215,14 @@ def main():
 
     # in case the test dataset is concatenated
     if isinstance(cfg.data.test, dict):
-        cfg.data.test.test_mode = True
+        cfg.data.test.test_mode = False
         if cfg.data.test_dataloader.get('samples_per_gpu', 1) > 1:
             # Replace 'ImageToTensor' to 'DefaultFormatBundle'
             cfg.data.test.pipeline = replace_ImageToTensor(
                 cfg.data.test.pipeline)
     elif isinstance(cfg.data.test, list):
         for ds_cfg in cfg.data.test:
-            ds_cfg.test_mode = True
+            ds_cfg.test_mode = False
         if cfg.data.test_dataloader.get('samples_per_gpu', 1) > 1:
             for ds_cfg in cfg.data.test:
                 ds_cfg.pipeline = replace_ImageToTensor(ds_cfg.pipeline)
@@ -223,11 +240,22 @@ def main():
         json_file = osp.join(args.work_dir, f'eval_{timestamp}.json')
 
     # build the dataloader
+    for p_cfg in  _train_cfg.pipeline:
+        if 'type' in p_cfg.keys() :
+            if p_cfg['type'] == 'LoadAnnotations':
+                cfg.data.test.pipeline.insert(1,p_cfg)
+            if p_cfg['type'] == 'Collect':
+                cfg.data.test.pipeline[-1].transforms[-1]['keys'] = p_cfg['keys']
+            if p_cfg['type'] == 'DefaultFormatBundle':
+                cfg.data.test.pipeline[-1].transforms.pop(-2)
+                cfg.data.test.pipeline[-1].transforms.insert(-1, p_cfg)
+    # cfg.data.test.pipeline.insert(1,dict(type='LoadAnnotations', with_bbox=True))
+    # cfg.data.test.pipeline[-1].transforms[-1]['keys'].extend(['gt_bboxes', 'gt_labels'])
     dataset = build_dataset(cfg.data.test)
     data_loader = build_dataloader(dataset, **test_loader_cfg)
 
     # build the model and load checkpoint
-    cfg.model.train_cfg = None
+    # cfg.model.train_cfg = None
     model = build_detector(cfg.model, test_cfg=cfg.get('test_cfg'))
     fp16_cfg = cfg.get('fp16', None)
     if fp16_cfg is not None:
@@ -244,40 +272,22 @@ def main():
 
     if not distributed:
         model = build_dp(model, cfg.device, device_ids=cfg.gpu_ids)
-        outputs = single_gpu_test(model, data_loader, args.show, args.show_dir,
-                                  args.show_score_thr)
+        # tag
+        single_gpu_adv(model, data_loader,args)
+        # outputs = single_gpu_test(model, data_loader, args.show, args.show_dir,
+        #                           args.show_score_thr)
     else:
         model = build_ddp(
             model,
             cfg.device,
             device_ids=[int(os.environ['LOCAL_RANK'])],
-            broadcast_buffers=False)
-        outputs = multi_gpu_test(
-            model, data_loader, args.tmpdir, args.gpu_collect
-            or cfg.evaluation.get('gpu_collect', False))
-
-    rank, _ = get_dist_info()
-    if rank == 0:
-        if args.out:
-            print(f'\nwriting results to {args.out}')
-            mmcv.dump(outputs, args.out)
-        kwargs = {} if args.eval_options is None else args.eval_options
-        if args.format_only:
-            dataset.format_results(outputs, **kwargs)
-        if args.eval:
-            eval_kwargs = cfg.get('evaluation', {}).copy()
-            # hard-code way to remove EvalHook args
-            for key in [
-                    'interval', 'tmpdir', 'start', 'gpu_collect', 'save_best',
-                    'rule', 'dynamic_intervals'
-            ]:
-                eval_kwargs.pop(key, None)
-            eval_kwargs.update(dict(metric=args.eval, **kwargs))
-            metric = dataset.evaluate(outputs, **eval_kwargs)
-            print(metric)
-            metric_dict = dict(config=args.config, metric=metric)
-            if args.work_dir is not None and rank == 0:
-                mmcv.dump(metric_dict, json_file)
+            broadcast_buffers=False,
+            find_unused_parameters=True)
+        # tag
+        multi_gpu_adv(model, data_loader, args)
+        # outputs = multi_gpu_test(
+        #     model, data_loader, args.tmpdir, args.gpu_collect
+        #     or cfg.evaluation.get('gpu_collect', False))
 
 
 if __name__ == '__main__':
