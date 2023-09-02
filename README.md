@@ -1,4 +1,10 @@
-# DFA
+# Exploring Inconsistent Knowledge Distillation for Object Detection with Data Augmentation 
+
+This repository contains the official PyTorch implementation of the following paper at **ACMMM 2023**: 
+
+> **Exploring Inconsistent Knowledge Distillation for Object Detection with Data Augmentation**<br>
+> Jiawei Liang, Siyuan Liang, Aishan Liu, Ke Ma, Jingzhi Li, Xiaochun Cao<br>
+> [https://arxiv.org/abs/2209.09841](https://arxiv.org/abs/2209.09841)
 
 # Installation
 
@@ -7,9 +13,8 @@
 * [Install mmcv_full (mmcv_full == 1.6.0)](https://github.com/open-mmlab/mmcv#installation)
 * [Install mmdetection (mmdetection == 2.25.0) from source code](https://mmdetection.readthedocs.io/en/latest/get_started.html#installation)
   ```bash
-    git clone https://github.com/open-mmlab/mmdetection.git
-    cd mmdetection/
-    git checkout v2.25.0
+    git clone https://github.com/JWLiang007/IKD.git
+    cd IKD/
     pip install -v -e .
   ```
 
@@ -59,6 +64,45 @@ bash tools/dist_test.sh configs/fgd/DFA_fgd_retina_rx101_64x4d_distill_retina_r5
 ```
 
 ## Generalizability
+
+#### Backdoor Defense 
+
+<table><tbody>
+<!-- START TABLE -->
+<!-- TABLE HEADER -->
+<th valign="center">Index</th>
+<th valign="center">Method</th>
+<th valign="center">ASR</th>
+<th valign="center">ASR Drop</th>
+
+
+<tr>
+<td align="center">1</td>
+<td align="center">Victim</td>
+<td align="center">96.7</td>
+<td align="center">-</td>
+</tr>
+
+<tr>
+<td align="center">2</td>
+<td align="center">NAD</td>
+<td align="center">82.88</td>
+<td align="center">13.82</td>
+</tr>
+<tr>
+<td align="center">3</td>
+<td align="center">Ours</td>
+<td align="center">78.26</td>
+<td align="center">18.44(↑33%)</td>
+</tr>
+
+</tbody></table>
+
+For more recent progress in backdoor defense, please refers to the following repo:
+
+[https://github.com/JWLiang007/BD_DeCLIP.git](https://github.com/JWLiang007/BD_DeCLIP.git) 
+
+and switches to the __bd__ branch.
 
 ## Acknowledgement
 
