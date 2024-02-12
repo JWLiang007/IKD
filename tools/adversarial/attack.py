@@ -320,6 +320,8 @@ class Attack(object):
         else:
             self.model.eval()
 
+        if self.model.module.__class__.__name__ == 'RepPointsDetector':
+            self.model.module.bbox_head.training = True
         images = self.forward(*input, **kwargs)
 
         if given_training:
