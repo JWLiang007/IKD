@@ -15,6 +15,7 @@ This repository contains the official PyTorch implementation of the following pa
   ```bash
     git clone https://github.com/JWLiang007/IKD.git
     cd IKD/
+    pip install -r requirements/optional.txt
     pip install -v -e .
   ```
 

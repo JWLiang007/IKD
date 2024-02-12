@@ -12,4 +12,4 @@ protobuf<=3.20.1
 pytest
 ubelt
 xdoctest>=0.10.0
-yapf
+yapf==0.40.1
